@@ -4,6 +4,7 @@ import Order, { KITCHEN_STATUS_LIST } from "../models/Order.js";
 import Product from "../models/Product.js";
 import Promo from "../models/Promo.js";
 import generateOrderId from "../utils/generateOrderId.js";
+import { checkConnection, createSnapTransaction, verifySignature } from "../utils/midtrans.js";
 import { protectAdmin } from "../middleware/authMiddleware.js";
 
 const router = express.Router();
@@ -105,6 +106,94 @@ router.post(
     });
 
     res.status(201).json(order);
+  })
+);
+
+// GET /api/orders/payment-config — Midtrans connection status + client key for Snap
+router.get(
+  "/payment-config",
+  asyncHandler(async (req, res) => {
+    const status = await checkConnection();
+    res.json({
+      ready: status.ready,
+      reason: status.reason,
+      clientKey: status.ready ? process.env.MIDTRANS_CLIENT_KEY : null,
+      snapJsUrl:
+        process.env.MIDTRANS_IS_PRODUCTION === "true"
+          ? "https://app.midtrans.com/snap/snap.js"
+          : "https://app.sandbox.midtrans.com/snap/snap.js",
+    });
+  })
+);
+
+// POST /api/orders/:orderId/pay — create Midtrans Snap transaction for an order
+router.post(
+  "/:orderId/pay",
+  asyncHandler(async (req, res) => {
+    const order = await Order.findOne({ orderId: req.params.orderId.toUpperCase() });
+    if (!order) {
+      res.status(404);
+      throw new Error("Pesanan tidak ditemukan");
+    }
+    if (order.paymentStatus === "paid") {
+      res.status(400);
+      throw new Error("Pesanan ini sudah dibayar");
+    }
+
+    // Midtrans requires a unique order_id per transaction attempt
+    const midtransOrderId = `${order.orderId}-${Date.now()}`;
+    const snap = await createSnapTransaction({
+      transaction_details: { order_id: midtransOrderId, gross_amount: order.total },
+      customer_details: { first_name: order.customerName, phone: order.phone },
+      item_details: [
+        ...order.items.map((i, idx) => ({
+          id: `item-${idx + 1}`,
+          name: i.name.slice(0, 50),
+          price: i.unitPrice,
+          quantity: i.qty,
+        })),
+        ...(order.tax ? [{ id: "tax", name: "PB1 10%", price: order.tax, quantity: 1 }] : []),
+        ...(order.deliveryFee
+          ? [{ id: "delivery", name: "Ongkir", price: order.deliveryFee, quantity: 1 }]
+          : []),
+        ...(order.discount
+          ? [{ id: "discount", name: "Diskon", price: -order.discount, quantity: 1 }]
+          : []),
+      ],
+      callbacks: { finish: `${process.env.CLIENT_URL}/lacak?order=${order.orderId}` },
+    });
+
+    order.midtransOrderId = midtransOrderId;
+    await order.save();
+    res.json({ token: snap.token, redirectUrl: snap.redirect_url });
+  })
+);
+
+// POST /api/orders/notification — Midtrans webhook (payment notification)
+router.post(
+  "/notification",
+  asyncHandler(async (req, res) => {
+    if (!verifySignature(req.body)) {
+      res.status(403);
+      throw new Error("Signature tidak valid");
+    }
+    const { order_id, transaction_status, fraud_status, transaction_id } = req.body;
+    const order = await Order.findOne({ midtransOrderId: order_id });
+    if (!order) {
+      res.status(404);
+      throw new Error("Pesanan tidak ditemukan");
+    }
+
+    let paymentStatus = order.paymentStatus;
+    if (transaction_status === "settlement" || (transaction_status === "capture" && fraud_status !== "challenge")) {
+      paymentStatus = "paid";
+    } else if (["deny", "cancel", "expire", "failure"].includes(transaction_status)) {
+      paymentStatus = "failed";
+    }
+    order.paymentStatus = paymentStatus;
+    order.midtransTransactionId = transaction_id;
+    await order.save();
+    res.json({ ok: true });
   })
 );
 

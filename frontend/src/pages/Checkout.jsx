@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { useCart } from "../context/CartContext.jsx";
 import api, { formatRupiah } from "../api/client.js";
@@ -18,6 +18,40 @@ const Checkout = () => {
   const [appliedPromo, setAppliedPromo] = useState(null);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
+
+  const [payConfig, setPayConfig] = useState(null); // null = checking
+  const [orderId, setOrderId] = useState(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    const init = async () => {
+      try {
+        const { data } = await api.get("/orders/payment-config");
+        if (!data.ready) throw new Error(data.reason);
+        await new Promise((resolve, reject) => {
+          if (window.snap) return resolve();
+          const script = document.createElement("script");
+          script.src = data.snapJsUrl;
+          script.setAttribute("data-client-key", data.clientKey);
+          script.onload = resolve;
+          script.onerror = () => reject(new Error("Gagal memuat Midtrans Snap."));
+          document.body.appendChild(script);
+        });
+        if (!cancelled) setPayConfig({ ready: true });
+      } catch (err) {
+        if (!cancelled)
+          setPayConfig({
+            ready: false,
+            reason:
+              err.response?.data?.message || err.message || "Tidak dapat terhubung ke Midtrans.",
+          });
+      }
+    };
+    init();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const tax = Math.round(subtotal * TAX_RATE);
   const deliveryFee = orderType === "delivery" ? DELIVERY_FEE : 0;
@@ -52,26 +86,41 @@ const Checkout = () => {
 
     setLoading(true);
     try {
-      const { data: order } = await api.post("/orders", {
-        customerName: name,
-        phone,
-        orderType,
-        notes,
-        promoCode: appliedPromo?.code || null,
-        items: items.map((i) => ({
-          productId: i.productId,
-          name: i.name,
-          size: i.size,
-          ice: i.ice,
-          sweetness: i.sweetness,
-          toppings: i.toppings,
-          qty: i.qty,
-        })),
+      let id = orderId;
+      if (!id) {
+        const { data: order } = await api.post("/orders", {
+          customerName: name,
+          phone,
+          orderType,
+          notes,
+          promoCode: appliedPromo?.code || null,
+          items: items.map((i) => ({
+            productId: i.productId,
+            name: i.name,
+            size: i.size,
+            ice: i.ice,
+            sweetness: i.sweetness,
+            toppings: i.toppings,
+            qty: i.qty,
+          })),
+        });
+        id = order.orderId;
+        setOrderId(id);
+      }
+
+      const { data: pay } = await api.post(`/orders/${id}/pay`);
+      const finish = () => {
+        clearCart();
+        navigate(`/lacak?order=${id}`);
+      };
+      window.snap.pay(pay.token, {
+        onSuccess: finish,
+        onPending: finish,
+        onError: () => setError("Pembayaran gagal. Silakan coba lagi."),
+        onClose: () => setError("Pembayaran belum selesai. Klik tombol bayar untuk melanjutkan."),
       });
-      clearCart();
-      navigate(`/lacak?order=${order.orderId}`);
     } catch (err) {
-      setError(err.response?.data?.message || "Gagal membuat pesanan");
+      setError(err.response?.data?.message || err.message || "Gagal memproses pembayaran");
     } finally {
       setLoading(false);
     }
@@ -212,11 +261,11 @@ const Checkout = () => {
             />
           </Field>
 
-          <div className="bg-brand/10 border border-brand/30 rounded-xl p-3 text-xs text-brand/90 mb-4">
-            Ini demo portofolio — pembayaran Midtrans belum terhubung ke kunci
-            sungguhan. Tambahkan <code>MIDTRANS_SERVER_KEY</code> di{" "}
-            <code>backend/.env</code> untuk mengaktifkan transaksi asli.
-          </div>
+          {payConfig && !payConfig.ready && (
+            <div className="bg-red-900/30 border border-red-700 text-red-300 text-xs rounded-xl p-3 mb-4">
+              Pembayaran Midtrans tidak tersedia: {payConfig.reason}
+            </div>
+          )}
 
           {error && (
             <p className="bg-red-900/30 border border-red-700 text-red-300 text-sm rounded-lg p-3 mb-4">
@@ -226,10 +275,14 @@ const Checkout = () => {
 
           <button
             onClick={handlePay}
-            disabled={loading}
-            className="w-full bg-brand text-black font-semibold py-3 rounded-full hover:bg-brand-light transition-colors disabled:opacity-60"
+            disabled={loading || !payConfig?.ready}
+            className="w-full bg-brand text-black font-semibold py-3 rounded-full hover:bg-brand-light transition-colors disabled:opacity-60 disabled:cursor-not-allowed"
           >
-            {loading ? "Memproses..." : "Bayar via Midtrans"}
+            {loading
+              ? "Memproses..."
+              : payConfig === null
+              ? "Menghubungkan ke Midtrans..."
+              : "Bayar via Midtrans"}
           </button>
           <p className="text-center text-xs text-gray-500 mt-3">
             Total dan diskon dihitung ulang oleh server — aman dari manipulasi harga.
